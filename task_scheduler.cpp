@@ -9,19 +9,22 @@
 #include <queue>
 #include <functional>
 #include <condition_variable>
+#include <signal.h>
+#include <future>
 
 using namespace std;
 
 enum TASK_TYPE {
     TASK_ONCE,
-    TASK_ATFIXEDRATE
+    TASK_ATFIXEDRATE,
+    TASK_ATDELAY,
 };
 
 class Scheduler;
 
 struct FunctionInfo {
     FunctionInfo(function<void()> fn, int time_to_run, TASK_TYPE type,
-        int fixed_rate, function<void(function<void()>, int)> callback)
+        int fixed_rate, function<void(function<void()>, int, int)> callback)
     : fn(fn),
       time_to_run(time_to_run),
       type(type),
@@ -33,7 +36,7 @@ struct FunctionInfo {
     }
 
     function<void()> fn;
-    function<void(function<void()>, int)> callback;
+    function<void(function<void()>, int, int)> callback;
     int time_to_run;
     TASK_TYPE type;
     int fixed_rate;
@@ -60,23 +63,28 @@ class ThreadPool {
                         task = que.front();
                         que.pop();
                     }
+
+
+                    if (task->type == TASK_ATFIXEDRATE) {
+                         const auto timeNow= chrono::system_clock::now();
+                        const auto duration= timeNow.time_since_epoch();
+                        uint64_t current_time = chrono::duration_cast<chrono::seconds>(duration).count();
+                        task->callback(task->fn, current_time + task->fixed_rate, task->fixed_rate);
+                    }
+
                     task->Run();
-                    const auto timeNow= chrono::system_clock::now();
-                    const auto duration= timeNow.time_since_epoch();
-                    uint64_t current_time = chrono::duration_cast<chrono::seconds>(duration).count();
-                    task->callback(task->fn, current_time + 20);
+
+                    if (task->type == TASK_ATDELAY) {
+                        const auto timeNow= chrono::system_clock::now();
+                        const auto duration= timeNow.time_since_epoch();
+                        uint64_t current_time = chrono::duration_cast<chrono::seconds>(duration).count();
+                        task->callback(task->fn, current_time + task->fixed_rate, task->fixed_rate);
+                    }
                     delete task;
                 }
             });
         }
     }
-
-   void cancel () {
-        {
-            unique_lock<mutex> lock(mt_);
-            stop_ = true;
-        }
-   }
 
     ~ThreadPool() {
         cout << "Thread Deletion\n";
@@ -164,8 +172,7 @@ public:
     }
 
     void ScheduleOnce(function<void()> fn, int start_time) {
-        auto callback = std::bind(&Scheduler::ScheduleOnce, this, std::placeholders::_1, std::placeholders::_2);
-        FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ONCE, 0, callback);
+        FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ONCE, 0, nullptr);
         {
             unique_lock<mutex>lock (mt_);
             que.push(fn_info);
@@ -174,7 +181,8 @@ public:
     }
 
     void ScheduleAtFixedRate(function<void()> fn, int start_time, int fixed_rate) {
-        auto callback = std::bind(&Scheduler::ScheduleOnce, this, std::placeholders::_1, std::placeholders::_2);
+        auto callback = std::bind(&Scheduler::ScheduleAtFixedRate, this,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
         FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ATFIXEDRATE, fixed_rate, callback);
         {
             unique_lock<mutex>lock (mt_);
@@ -183,15 +191,16 @@ public:
         cv_.notify_all();
     }
 
-    void Callback() {
-
+    void ScheduleAtFixedRateWithDelay(function<void()> fn, int start_time, int fixed_rate) {
+        auto callback = std::bind(&Scheduler::ScheduleAtFixedRateWithDelay, this,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3);
+        FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ATDELAY, fixed_rate, callback);
+        {
+            unique_lock<mutex>lock (mt_);
+            que.push(fn_info);
+        }
+        cv_.notify_all();
     }
-
-    /*
-    static Scheduler* GetInstance();
-
-    static Scheduler* sc_;
-    */
 
 private:
     ThreadPool thread_pool_;
@@ -201,19 +210,6 @@ private:
     bool stop_;
     priority_queue<FunctionInfo*, vector<FunctionInfo*>, RunTimeOrder> que;
 };
-
-/*
-Scheduler* Scheduler::sc_ = nullptr;;
-
-
-Scheduler* Scheduler::GetInstance() {
-
-    if (sc_ == nullptr) {
-        sc_ = new Scheduler(3);
-    }
-    return sc_;
-}
-*/
 
 int main() {
 
@@ -229,17 +225,21 @@ int main() {
     sch->ScheduleOnce([]() {
         cout << "Executing Task 1 by  " << this_thread::get_id() << "\n";
         }, current_time + 10);
-    sleep(2);
 
-    sch->ScheduleOnce([]() {
+    sch->ScheduleAtFixedRate([]() {
         cout << "Executing Task 2 by  " << this_thread::get_id() << "\n";
-        }, current_time + 10);
+        }, current_time + 10, 5);
 
-    sch->ScheduleOnce([]() {
+    sch->ScheduleAtFixedRate([]() {
         cout << "Executing Task 3 by " << this_thread::get_id() << "\n";
-        }, current_time + 5);
+        }, current_time + 5, 10);
 
-    sleep (30);
+     sch->ScheduleAtFixedRateWithDelay([]() {
+        cout << "Executing Task 4 by " << this_thread::get_id() << "\n";
+        sleep(10);
+        }, current_time + 5, 10);
+
+    sleep (100);
     delete sch;
     return 0;
 }
