@@ -9,18 +9,34 @@
 #include <queue>
 #include <functional>
 #include <condition_variable>
-#include <signal.h>
-#include <future>
 
 using namespace std;
 
+enum TASK_TYPE {
+    TASK_ONCE,
+    TASK_ATFIXEDRATE
+};
+
+class Scheduler;
+
 struct FunctionInfo {
-    FunctionInfo(function<void()> fn, int time_to_run)
+    FunctionInfo(function<void()> fn, int time_to_run, TASK_TYPE type,
+        int fixed_rate, function<void(function<void()>, int)> callback)
     : fn(fn),
-      time_to_run(time_to_run) {}
+      time_to_run(time_to_run),
+      type(type),
+      fixed_rate(fixed_rate),
+      callback(callback) {}
+
+    void Run() {
+        fn();
+    }
 
     function<void()> fn;
+    function<void(function<void()>, int)> callback;
     int time_to_run;
+    TASK_TYPE type;
+    int fixed_rate;
 };
 
 class ThreadPool {
@@ -30,27 +46,40 @@ class ThreadPool {
         for (size_t i = 0; i < num_threads; i++) {
             threads_.emplace_back([this]() {
                 while(true) {
-                    function<void()> task;
+                    FunctionInfo* task;
                     {
                         unique_lock<mutex> lock(mt_);
                         cv_.wait(lock, [this] {
                             return (que.size() > 0 || stop_);
                         });
 
-                        if (stop_ && que.size() == 0) {
+                        if (stop_) {
                             break;
                         }
 
                         task = que.front();
                         que.pop();
                     }
-                    task();
+                    task->Run();
+                    const auto timeNow= chrono::system_clock::now();
+                    const auto duration= timeNow.time_since_epoch();
+                    uint64_t current_time = chrono::duration_cast<chrono::seconds>(duration).count();
+                    task->callback(task->fn, current_time + 20);
+                    delete task;
                 }
             });
         }
     }
 
+   void cancel () {
+        {
+            unique_lock<mutex> lock(mt_);
+            stop_ = true;
+        }
+   }
+
     ~ThreadPool() {
+        cout << "Thread Deletion\n";
         {
             unique_lock<mutex> lock(mt_);
             stop_ = true;
@@ -62,9 +91,8 @@ class ThreadPool {
         }
     }
 
-    void AddTask(function<void()> fn) {
+    void AddTask(FunctionInfo* fn) {
         mt_.lock();
-        //cout << " Adding task to queue ";
         que.push(fn);
         mt_.unlock();
         cv_.notify_one();
@@ -74,7 +102,7 @@ private:
     vector<thread> threads_;
     mutex mt_;
     condition_variable cv_;
-    queue<function<void()>> que;
+    queue<FunctionInfo*> que;
     bool stop_;
 };
 
@@ -91,14 +119,14 @@ public:
        stop_(false) {
         thread_ = thread([this]() {
             while (true) {
-                function<void()> fn;
+                FunctionInfo* fn;
                 {
                     unique_lock<mutex> lock(mt_);
                     cv_.wait(lock, [this] {
                         return (que.size() > 0 || stop_);
                     });
 
-                    if (stop_ && que.size() == 0) {
+                    if (stop_) {
                         break;
                     }
 
@@ -111,18 +139,23 @@ public:
                         continue;
                     }
 
-                    auto top = que.top();
+                    fn = que.top();
                     que.pop();
-                    fn = top->fn;
-                    delete top;
                 }
                 thread_pool_.AddTask(fn);
             }
         });
     }
 
+    void cancel () {
+        unique_lock<mutex> lock(mt_);
+        stop_ = true;
+        cv_.notify_all();
+    }
+
     ~Scheduler() {
         {
+            cout << "Deletion\n";
             unique_lock<mutex> lock(mt_);
             stop_ = true;
             cv_.notify_all();
@@ -131,13 +164,34 @@ public:
     }
 
     void ScheduleOnce(function<void()> fn, int start_time) {
-        FunctionInfo* fn_info = new FunctionInfo(fn, start_time);
+        auto callback = std::bind(&Scheduler::ScheduleOnce, this, std::placeholders::_1, std::placeholders::_2);
+        FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ONCE, 0, callback);
         {
             unique_lock<mutex>lock (mt_);
             que.push(fn_info);
         }
         cv_.notify_all();
     }
+
+    void ScheduleAtFixedRate(function<void()> fn, int start_time, int fixed_rate) {
+        auto callback = std::bind(&Scheduler::ScheduleOnce, this, std::placeholders::_1, std::placeholders::_2);
+        FunctionInfo* fn_info = new FunctionInfo(fn, start_time, TASK_TYPE::TASK_ATFIXEDRATE, fixed_rate, callback);
+        {
+            unique_lock<mutex>lock (mt_);
+            que.push(fn_info);
+        }
+        cv_.notify_all();
+    }
+
+    void Callback() {
+
+    }
+
+    /*
+    static Scheduler* GetInstance();
+
+    static Scheduler* sc_;
+    */
 
 private:
     ThreadPool thread_pool_;
@@ -148,9 +202,23 @@ private:
     priority_queue<FunctionInfo*, vector<FunctionInfo*>, RunTimeOrder> que;
 };
 
+/*
+Scheduler* Scheduler::sc_ = nullptr;;
+
+
+Scheduler* Scheduler::GetInstance() {
+
+    if (sc_ == nullptr) {
+        sc_ = new Scheduler(3);
+    }
+    return sc_;
+}
+*/
+
 int main() {
 
-    Scheduler sch(3);
+    Scheduler* sch = new Scheduler(2);
+
 
     const auto timeNow= chrono::system_clock::now();
     const auto duration= timeNow.time_since_epoch();
@@ -158,13 +226,20 @@ int main() {
 
     cout << "Current time : " << current_time << "\n";
 
-    sch.ScheduleOnce([]() {
+    sch->ScheduleOnce([]() {
         cout << "Executing Task 1 by  " << this_thread::get_id() << "\n";
-        }, current_time + 30);
+        }, current_time + 10);
+    sleep(2);
 
-    sch.ScheduleOnce([]() {
-        cout << "Executing Task 2 by " << this_thread::get_id() << "\n";
+    sch->ScheduleOnce([]() {
+        cout << "Executing Task 2 by  " << this_thread::get_id() << "\n";
         }, current_time + 10);
 
+    sch->ScheduleOnce([]() {
+        cout << "Executing Task 3 by " << this_thread::get_id() << "\n";
+        }, current_time + 5);
+
+    sleep (30);
+    delete sch;
     return 0;
 }
